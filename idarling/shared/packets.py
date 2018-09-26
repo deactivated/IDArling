@@ -10,8 +10,16 @@
 
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
+from __future__ import unicode_literals
+
+import sys
 import collections
 import itertools
+
+
+# Allow testing for unicode strings
+if sys.version_info.major == 3:
+    unicode = str
 
 
 def with_metaclass(meta, *bases):
@@ -25,7 +33,7 @@ def with_metaclass(meta, *bases):
         def __prepare__(cls, name, _):
             return meta.__prepare__(name, bases)
 
-    return type.__new__(Metaclass, "temporary_class", (), {})
+    return type.__new__(Metaclass, str("temporary_class"), (), {})
 
 
 class Serializable(object):
@@ -60,8 +68,17 @@ class Default(Serializable):
         Get a filtered version of an attributes dictionary. This method
         currently simply removes the private attributes of the object.
         """
+
+        def try_decode(s):
+            # Force attribute keys to be unicode on the wire.
+            if not isinstance(s, unicode):
+                return s.decode("utf-8")
+            return s
+
         return {
-            key: val for key, val in dct.items() if not key.startswith("_")
+            try_decode(key): val
+            for key, val in dct.items()
+            if not key.startswith("_")
         }
 
     def build_default(self, dct):

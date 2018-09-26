@@ -12,12 +12,12 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 import collections
 import errno
-import json
 import os
 import socket
 import ssl
 import sys
 
+from msgpack import Unpacker, packb
 from PyQt5.QtCore import QCoreApplication, QEvent, QObject, QSocketNotifier
 
 from .packets import Container, Packet, PacketDeferred, Query, Reply
@@ -50,11 +50,14 @@ class ClientSocket(QObject):
         self._socket = None
         self._server = parent and isinstance(parent, ServerSocket)
 
+        self._unpacker = Unpacker(raw=False)
         self._read_buffer = bytearray()
         self._read_notifier = None
         self._read_packet = None
+        self._read_content = bytearray()
 
-        self._write_buffer = bytearray()
+        self._write_item = None
+        self._write_buffer = []
         self._write_notifier = None
         self._write_packet = None
 
@@ -69,6 +72,8 @@ class ClientSocket(QObject):
 
     def wrap_socket(self, sock):
         """Sets the underlying socket to use."""
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
         self._read_notifier = QSocketNotifier(
             sock.fileno(), QSocketNotifier.Read, self
         )
@@ -181,50 +186,42 @@ class ClientSocket(QObject):
             ):
                 self.disconnect(e)
             return  # No more data available
-        self._read_buffer.extend(data)
+        self._unpacker.feed(data)
 
         # Split the received data on new lines (= packets)
-        while True:
+        for raw_packet in self._unpacker:
             if self._read_packet is None:
-                if b"\n" in self._read_buffer:
-                    pos = self._read_buffer.index(b"\n")
-                    line = self._read_buffer[:pos]
-                    self._read_buffer = self._read_buffer[
-                        pos + 1 :  # noqa: E203
-                    ]
-
-                    # Try to parse the line (= packet)
-                    try:
-                        dct = json.loads(line.decode("utf-8"))
-                        self._read_packet = Packet.parse_packet(
-                            dct, self._server
-                        )
-                    except Exception as e:
-                        msg = "Invalid packet received: %s" % line
-                        self._logger.warning(msg)
-                        self._logger.exception(e)
-                        continue
-                else:
-                    break  # Not enough data for a packet
-
-            else:
+                try:
+                    self._read_packet = Packet.parse_packet(
+                        raw_packet, self._server
+                    )
+                except Exception as e:
+                    msg = "Invalid packet received: %r" % raw_packet
+                    self._logger.warning(msg)
+                    self._logger.exception(e)
+                    continue
                 if isinstance(self._read_packet, Container):
-                    avail = len(self._read_buffer)
-                    total = self._read_packet.size
+                    continue
+            else:
+                assert isinstance(raw_packet, bytes)
+                self._read_content.extend(raw_packet)
 
-                    # Trigger the downback
-                    if self._read_packet.downback:
-                        self._read_packet.downback(min(avail, total), total)
+                # Trigger the downback
+                avail = len(self._read_content)
+                total = self._read_packet.size
 
-                    # Read the container's content
-                    if avail >= total:
-                        self._read_packet.content = self._read_buffer[:total]
-                        self._read_buffer = self._read_buffer[total:]
-                    else:
-                        break  # Not enough data for a packet
+                if self._read_packet.downback:
+                    self._read_packet.downback(min(avail, total), total)
 
-                self._incoming.append(self._read_packet)
-                self._read_packet = None
+                if avail >= total:
+                    assert avail == total
+                    self._read_packet.content = self._read_content
+                    self._read_content = bytearray()
+                else:
+                    continue
+
+            self._incoming.append(self._read_packet)
+            self._read_packet = None
 
         if self._incoming:
             QCoreApplication.instance().postEvent(self, PacketEvent())
@@ -234,15 +231,15 @@ class ClientSocket(QObject):
         if not self._check_socket():
             return
 
-        if not self._write_buffer:
+        if not self._write_item and not self._write_buffer:
             if not self._outgoing:
+                self._write_notifier.setEnabled(False)
                 return  # No more packets to send
             self._write_packet = self._outgoing.popleft()
 
-            # Dump the packet as a line
+            # Dump the packet to a dictionary
             try:
-                line = json.dumps(self._write_packet.build_packet())
-                line = line.encode("utf-8") + b"\n"
+                self._write_buffer.append(self._write_packet.build_packet())
             except Exception as e:
                 msg = "Invalid packet being sent: %s" % self._write_packet
                 self._logger.warning(msg)
@@ -250,17 +247,38 @@ class ClientSocket(QObject):
                 return
 
             # Write the container's content
-            self._write_buffer.extend(bytearray(line))
             if isinstance(self._write_packet, Container):
-                data = self._write_packet.content
-                self._write_buffer.extend(bytearray(data))
-                self._write_packet.size += len(line)
+                self._write_buffer.append(self._write_packet.content)
 
-        # Send as many bytes as possible
+        # Next item
+        if not self._write_item:
+            self._write_item = self._write_buffer.pop(0)
+
         try:
-            count = min(len(self._write_buffer), ClientSocket.MAX_DATA_SIZE)
-            sent = self._socket.send(self._write_buffer[:count])
-            self._write_buffer = self._write_buffer[sent:]
+            # Send as many bytes as possible
+            if isinstance(self._write_item, bytes):
+                count = min(
+                    len(self._write_item),
+                    ClientSocket.MAX_DATA_SIZE - 10
+                )
+                packed = packb(self._write_item[:count], use_bin_type=True)
+                sent = self._socket.send(packed)
+                assert sent == len(packed)
+                self._write_item = self._write_item[count:]
+            elif hasattr(self._write_item, "read"):
+                chunk = self._write_item.read(ClientSocket.MAX_DATA_SIZE - 10)
+                count = len(chunk)
+                packed = packb(chunk, use_bin_type=True)
+                sent = self._socket.send(packed)
+                assert sent == len(packed)
+                if len(chunk) < ClientSocket.MAX_DATA_SIZE:
+                    self._write_item = None
+            else:
+                count = 0
+                packed = packb(self._write_item, use_bin_type=True)
+                sent = self._socket.send(packed)
+                assert sent == len(packed)
+                self._write_item = None
         except socket.error as e:
             if (
                 e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK)
@@ -279,9 +297,6 @@ class ClientSocket(QObject):
             total = len(self._write_packet.content)
             sent = max(total - self._write_packet.size, 0)
             self._write_packet.upback(sent, total)
-
-        if not self._write_buffer and not self._write_packet:
-            self._write_notifier.setEnabled(False)
 
     def event(self, event):
         """Callback called when a Qt event is fired."""
@@ -352,6 +367,8 @@ class ServerSocket(QObject):
 
     def connect(self, sock):
         """Sets the underlying socket to utilize."""
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
         self._accept_notifier = QSocketNotifier(
             sock.fileno(), QSocketNotifier.Read, self
         )

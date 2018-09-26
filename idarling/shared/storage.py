@@ -10,7 +10,7 @@
 
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
-import json
+import msgpack
 import sqlite3
 
 from .models import Database, Project
@@ -106,7 +106,7 @@ class Storage(object):
                 "project": client.project,
                 "database": client.database,
                 "tick": event.tick,
-                "dict": json.dumps(dct),
+                "dict": msgpack.packb(dct, use_bin_type=True),
             },
         )
 
@@ -118,7 +118,7 @@ class Storage(object):
         c.execute(sql, [project, database, tick])
         events = []
         for result in c.fetchall():
-            dct = json.loads(result["dict"])
+            dct = msgpack.unpackb(result['dict'], raw=False)
             dct["tick"] = result["tick"]
             events.append(DefaultEvent.new(dct))
         return events
